@@ -4,7 +4,7 @@ venv/
 ENV/
 *.pyc
 __pycache__/
-
+GitHub.py
 # 忽略本地敏感文件
 .env
 ###=== END_SYNC ===###
