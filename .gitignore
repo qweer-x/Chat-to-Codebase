@@ -1,0 +1,10 @@
+# 忽略 Python 虚拟环境
+.venv/
+venv/
+ENV/
+*.pyc
+__pycache__/
+
+# 忽略本地敏感文件
+.env
+###=== END_SYNC ===###
