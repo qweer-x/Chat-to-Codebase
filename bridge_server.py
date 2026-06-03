@@ -3,7 +3,12 @@ AUTO_SYNC Bridge Server
 
 定位：
     网页大模型负责思考和生成代码。
-    本地脚本负责接收、写入、备份、提交。
+    本地脚本负责接收、写入、创建目录、删除、备份、提交。
+
+权限模型：
+    项目根目录内部：允许完整控制。
+    项目根目录外部：绝对禁止。
+    默认保护 .git、.env、私钥、证书等敏感路径。
 
 运行：
     python bridge_server.py
@@ -12,13 +17,14 @@ AUTO_SYNC Bridge Server
     http://127.0.0.1:9999
 
 环境变量：
-    AUTO_SYNC_PROJECT_ROOT      项目根目录，默认当前目录
-    AUTO_SYNC_HOST              默认 127.0.0.1
-    AUTO_SYNC_PORT              默认 9999
-    AUTO_SYNC_GIT_ENABLED       true/false，默认 false
-    AUTO_SYNC_GIT_PUSH          true/false，默认 false
-    AUTO_SYNC_BACKUP_ENABLED    true/false，默认 true
-    AUTO_SYNC_LOG_DIR           默认 .auto_sync_logs
+    AUTO_SYNC_PROJECT_ROOT             项目根目录，默认当前目录
+    AUTO_SYNC_HOST                     默认 127.0.0.1
+    AUTO_SYNC_PORT                     默认 9999
+    AUTO_SYNC_GIT_ENABLED              true/false，默认 false
+    AUTO_SYNC_GIT_PUSH                 true/false，默认 false
+    AUTO_SYNC_BACKUP_ENABLED           true/false，默认 true
+    AUTO_SYNC_LOG_DIR                  默认 .auto_sync_logs
+    AUTO_SYNC_ALLOW_PROTECTED_PATHS    true/false，默认 false
 
 说明：
     这个服务只建议在本机 127.0.0.1 使用，不要暴露到公网。
@@ -52,11 +58,13 @@ class BridgeConfig:
     git_enabled: bool
     git_push: bool
     backup_enabled: bool
+    allow_protected_paths: bool
     log_dir: Path
 
 
 @dataclass
 class SyncBlock:
+    action: str
     file_path: str
     content: str
 
@@ -143,6 +151,7 @@ def load_config() -> BridgeConfig:
         git_enabled=env_bool("AUTO_SYNC_GIT_ENABLED", False),
         git_push=env_bool("AUTO_SYNC_GIT_PUSH", False),
         backup_enabled=env_bool("AUTO_SYNC_BACKUP_ENABLED", True),
+        allow_protected_paths=env_bool("AUTO_SYNC_ALLOW_PROTECTED_PATHS", False),
         log_dir=log_dir,
     )
 
@@ -216,7 +225,7 @@ def extract_raw_blocks(text: str) -> list[str]:
 
     stripped = text.strip()
 
-    if stripped.startswith("FILE:"):
+    if stripped.startswith("FILE:") or stripped.startswith("ACTION:"):
         return [START_MARK + "\n" + stripped + "\n" + END_MARK]
 
     raise SyncError("没有找到同步协议块。")
@@ -234,33 +243,51 @@ def parse_block(raw_block: str) -> SyncBlock:
     inner = inner.strip("\r\n")
     lines = inner.splitlines()
 
+    action = "write"
     file_line_index = -1
     file_path = ""
 
     for index, line in enumerate(lines):
-        if line.strip().startswith("FILE:"):
+        stripped = line.strip()
+
+        if stripped.startswith("ACTION:"):
+            action_value = stripped.split("ACTION:", 1)[1].strip().lower()
+
+            if action_value:
+                action = action_value
+
+            continue
+
+        if stripped.startswith("FILE:"):
             file_line_index = index
-            file_path = line.split("FILE:", 1)[1].strip()
+            file_path = stripped.split("FILE:", 1)[1].strip()
             break
+
+    if action not in {"write", "delete", "mkdir"}:
+        raise SyncError(f"不支持的 ACTION：{action}")
 
     if file_line_index == -1:
         raise SyncError("协议块中没有找到 FILE: 行。")
 
     if not file_path:
-        raise SyncError("FILE: 后面的文件路径为空。")
+        raise SyncError("FILE: 后面的路径为空。")
 
     content_lines = lines[file_line_index + 1:]
     content = "\n".join(content_lines)
 
-    return SyncBlock(file_path=file_path, content=content)
+    return SyncBlock(action=action, file_path=file_path, content=content)
 
 
-def is_sensitive_path(relative_path: str) -> bool:
-    normalized = relative_path.replace("\\", "/").strip()
+def is_protected_path(relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/").strip().strip("/")
     lower = normalized.lower()
+    parts = [part.lower() for part in lower.split("/") if part]
     name = Path(normalized).name.lower()
 
-    if lower == ".git" or lower.startswith(".git/"):
+    if not parts:
+        return False
+
+    if parts[0] == ".git":
         return True
 
     if lower == ".env":
@@ -295,14 +322,14 @@ def is_sensitive_path(relative_path: str) -> bool:
     return False
 
 
-def resolve_safe_target(relative_path: str) -> Path:
+def normalize_relative_path(relative_path: str) -> str:
     raw_path = relative_path.strip().replace("\\", "/")
 
     if not raw_path:
-        raise SyncError("文件路径为空。")
+        raise SyncError("路径为空。")
 
     if "\x00" in raw_path:
-        raise SyncError("文件路径包含非法空字符。")
+        raise SyncError("路径包含非法空字符。")
 
     if raw_path.startswith("/") or raw_path.startswith("~"):
         raise SyncError(f"禁止使用绝对路径或用户目录路径：{relative_path}")
@@ -322,13 +349,21 @@ def resolve_safe_target(relative_path: str) -> Path:
         parts.append(part)
 
     if not parts:
-        raise SyncError("文件路径无效。")
+        raise SyncError("路径无效。")
 
     normalized = "/".join(parts)
 
-    if is_sensitive_path(normalized):
-        raise SyncError(f"安全拦截：禁止写入敏感路径：{relative_path}")
+    if is_protected_path(normalized) and not CONFIG.allow_protected_paths:
+        raise SyncError(
+            f"安全拦截：默认禁止操作受保护路径：{relative_path}。"
+            "如确实需要，请手动设置 AUTO_SYNC_ALLOW_PROTECTED_PATHS=true。"
+        )
 
+    return normalized
+
+
+def resolve_safe_target(relative_path: str) -> tuple[str, Path]:
+    normalized = normalize_relative_path(relative_path)
     target = (CONFIG.project_root / normalized).resolve()
 
     try:
@@ -336,31 +371,38 @@ def resolve_safe_target(relative_path: str) -> Path:
     except ValueError as exc:
         raise SyncError(f"目标路径越过项目根目录：{relative_path}") from exc
 
-    return target
+    return normalized, target
 
 
-def backup_existing_file(target: Path, relative_path: str) -> Optional[str]:
+def backup_existing_path(target: Path, relative_path: str) -> Optional[str]:
     if not CONFIG.backup_enabled:
         return None
 
-    if not target.exists() or not target.is_file():
+    if not target.exists():
         return None
 
-    safe_name = relative_path.replace("\\", "/").replace("/", "__")
+    safe_name = relative_path.replace("\\", "/").strip("/").replace("/", "__")
     backup_name = f"{now_file_text()}__{safe_name}"
     backup_path = CONFIG.log_dir / "backups" / backup_name
     backup_path.parent.mkdir(parents=True, exist_ok=True)
 
-    shutil.copy2(target, backup_path)
+    if target.is_dir():
+        shutil.copytree(target, backup_path)
+    else:
+        shutil.copy2(target, backup_path)
 
     return str(backup_path)
 
 
 def write_file(block: SyncBlock) -> dict[str, Any]:
-    target = resolve_safe_target(block.file_path)
+    normalized_path, target = resolve_safe_target(block.file_path)
+
+    if target.exists() and target.is_dir():
+        raise SyncError(f"写入失败：目标路径是目录，不是文件：{block.file_path}")
+
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    backup_path = backup_existing_file(target, block.file_path)
+    backup_path = backup_existing_path(target, normalized_path)
 
     old_content = None
 
@@ -372,7 +414,8 @@ def write_file(block: SyncBlock) -> dict[str, Any]:
     changed = old_content != block.content
 
     result = {
-        "file": block.file_path,
+        "action": "write",
+        "file": normalized_path,
         "target": str(target),
         "changed": changed,
         "backup": backup_path,
@@ -383,13 +426,107 @@ def write_file(block: SyncBlock) -> dict[str, Any]:
         {
             "type": "write_file",
             "ok": True,
-            "file": block.file_path,
+            "file": normalized_path,
             "changed": changed,
             "backup": backup_path,
         }
     )
 
     return result
+
+
+def make_directory(block: SyncBlock) -> dict[str, Any]:
+    normalized_path, target = resolve_safe_target(block.file_path)
+
+    if target.exists() and target.is_file():
+        raise SyncError(f"创建目录失败：目标路径已存在同名文件：{block.file_path}")
+
+    changed = not target.exists()
+    target.mkdir(parents=True, exist_ok=True)
+
+    result = {
+        "action": "mkdir",
+        "file": normalized_path,
+        "target": str(target),
+        "changed": changed,
+    }
+
+    write_log(
+        {
+            "type": "mkdir",
+            "ok": True,
+            "file": normalized_path,
+            "changed": changed,
+        }
+    )
+
+    return result
+
+
+def delete_path(block: SyncBlock) -> dict[str, Any]:
+    normalized_path, target = resolve_safe_target(block.file_path)
+
+    if not target.exists():
+        result = {
+            "action": "delete",
+            "file": normalized_path,
+            "target": str(target),
+            "changed": False,
+            "message": "路径不存在，跳过删除。",
+        }
+
+        write_log(
+            {
+                "type": "delete_path",
+                "ok": True,
+                "file": normalized_path,
+                "changed": False,
+                "message": "not exists",
+            }
+        )
+
+        return result
+
+    backup_path = backup_existing_path(target, normalized_path)
+
+    if target.is_dir():
+        shutil.rmtree(target)
+        deleted_type = "directory"
+    else:
+        target.unlink()
+        deleted_type = "file"
+
+    result = {
+        "action": "delete",
+        "file": normalized_path,
+        "target": str(target),
+        "changed": True,
+        "deleted_type": deleted_type,
+        "backup": backup_path,
+    }
+
+    write_log(
+        {
+            "type": "delete_path",
+            "ok": True,
+            "file": normalized_path,
+            "changed": True,
+            "deleted_type": deleted_type,
+            "backup": backup_path,
+        }
+    )
+
+    return result
+
+
+def apply_block(block: SyncBlock) -> dict[str, Any]:
+    if block.action == "delete":
+        return delete_path(block)
+
+    if block.action == "mkdir":
+        return make_directory(block)
+
+    return write_file(block)
 
 
 def run_command(command: list[str], cwd: Path) -> dict[str, Any]:
@@ -443,7 +580,7 @@ def git_commit_and_push(changed_files: list[str]) -> dict[str, Any]:
     commands: list[dict[str, Any]] = []
 
     for file_path in changed_files:
-        commands.append(run_command(["git", "add", "--", file_path], CONFIG.project_root))
+        commands.append(run_command(["git", "add", "-A", "--", file_path], CONFIG.project_root))
 
     status_result = run_command(["git", "status", "--porcelain"], CONFIG.project_root)
     commands.append(status_result)
@@ -512,7 +649,7 @@ def index() -> Response:
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-            max-width: 900px;
+            max-width: 920px;
             margin: 40px auto;
             line-height: 1.7;
             color: #222;
@@ -546,11 +683,14 @@ def index() -> Response:
     <p class="ok">服务正在运行。</p>
     <div class="box">
         <p><b>项目根目录：</b><code>{CONFIG.project_root}</code></p>
+        <p><b>权限边界：</b><code>仅允许操作项目根目录内部</code></p>
         <p><b>同步接口：</b><code>POST /sync</code></p>
         <p><b>健康检查：</b><code>GET /health</code></p>
+        <p><b>支持动作：</b><code>write / delete / mkdir</code></p>
         <p><b>Git 自动提交：</b><code>{CONFIG.git_enabled}</code></p>
         <p><b>Git 自动推送：</b><code>{CONFIG.git_push}</code></p>
         <p><b>备份：</b><code>{CONFIG.backup_enabled}</code></p>
+        <p><b>受保护路径开关：</b><code>{CONFIG.allow_protected_paths}</code></p>
         <p><b>日志目录：</b><code>{CONFIG.log_dir}</code></p>
     </div>
     <p class="warn">提示：本服务只建议在本机 127.0.0.1 使用，不要暴露到公网。</p>
@@ -568,10 +708,13 @@ def health() -> Response:
             "service": "AUTO_SYNC Bridge Server",
             "time": now_text(),
             "project_root": str(CONFIG.project_root),
+            "permission_boundary": "project_root_only",
             "git_enabled": CONFIG.git_enabled,
             "git_push": CONFIG.git_push,
             "backup_enabled": CONFIG.backup_enabled,
+            "allow_protected_paths": CONFIG.allow_protected_paths,
             "log_dir": str(CONFIG.log_dir),
+            "actions": ["write", "delete", "mkdir"],
         }
     )
 
@@ -588,15 +731,15 @@ def sync() -> Response:
         raw_blocks = extract_raw_blocks(text)
         parsed_blocks = [parse_block(raw_block) for raw_block in raw_blocks]
 
-        write_results = []
+        results = []
         changed_files = []
 
         for block in parsed_blocks:
-            result = write_file(block)
-            write_results.append(result)
+            result = apply_block(block)
+            results.append(result)
 
-            if result["changed"]:
-                changed_files.append(block.file_path)
+            if result.get("changed"):
+                changed_files.append(result["file"])
 
         if changed_files:
             git_result = git_commit_and_push(changed_files)
@@ -609,8 +752,8 @@ def sync() -> Response:
         response_payload = {
             "ok": True,
             "message": "AUTO_SYNC 同步完成。",
-            "count": len(write_results),
-            "files": write_results,
+            "count": len(results),
+            "files": results,
             "git": git_result,
         }
 
@@ -618,7 +761,7 @@ def sync() -> Response:
             {
                 "type": "sync",
                 "ok": True,
-                "count": len(write_results),
+                "count": len(results),
                 "changed_files": changed_files,
                 "git": git_result,
             }
@@ -653,10 +796,13 @@ def print_startup_info() -> None:
     print(f"同步接口: http://{CONFIG.host}:{CONFIG.port}/sync")
     print(f"健康检查: http://{CONFIG.host}:{CONFIG.port}/health")
     print(f"项目根目录: {CONFIG.project_root}")
+    print("权限边界: 仅允许操作项目根目录内部")
     print(f"日志目录: {CONFIG.log_dir}")
     print(f"Git 自动提交: {CONFIG.git_enabled}")
     print(f"Git 自动推送: {CONFIG.git_push}")
-    print(f"备份旧文件: {CONFIG.backup_enabled}")
+    print(f"备份旧内容: {CONFIG.backup_enabled}")
+    print(f"允许受保护路径: {CONFIG.allow_protected_paths}")
+    print("支持动作: write / delete / mkdir")
     print("=" * 72)
 
 
