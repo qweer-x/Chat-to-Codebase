@@ -1,8 +1,9 @@
 """
 AUTO_SYNC Bridge Server
 
-网页大模型负责思考和生成代码。
-本地脚本负责接收、写入、备份、提交。
+定位：
+    网页大模型负责思考和生成代码。
+    本地脚本负责接收、写入、备份、提交。
 
 运行：
     python bridge_server.py
@@ -18,6 +19,9 @@ AUTO_SYNC Bridge Server
     AUTO_SYNC_GIT_PUSH          true/false，默认 false
     AUTO_SYNC_BACKUP_ENABLED    true/false，默认 true
     AUTO_SYNC_LOG_DIR           默认 .auto_sync_logs
+
+说明：
+    这个服务只建议在本机 127.0.0.1 使用，不要暴露到公网。
 """
 
 import json
@@ -37,6 +41,7 @@ END_MARK = "###=== END" + "_SYNC ===###"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9999
+DEFAULT_LOG_DIR = ".auto_sync_logs"
 
 
 @dataclass
@@ -60,6 +65,40 @@ class SyncError(Exception):
     pass
 
 
+def load_dotenv_if_exists() -> None:
+    env_path = Path(".env")
+
+    if not env_path.exists():
+        return
+
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if not key:
+            continue
+
+        if key not in os.environ:
+            os.environ[key] = value
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
 
@@ -78,15 +117,23 @@ def now_file_text() -> str:
 
 
 def load_config() -> BridgeConfig:
-    root = Path(os.getenv("AUTO_SYNC_PROJECT_ROOT", ".")).expanduser().resolve()
-    host = os.getenv("AUTO_SYNC_HOST", DEFAULT_HOST)
+    load_dotenv_if_exists()
+
+    root_raw = os.getenv("AUTO_SYNC_PROJECT_ROOT", "").strip()
+
+    if root_raw:
+        root = Path(root_raw).expanduser().resolve()
+    else:
+        root = Path(".").resolve()
+
+    host = os.getenv("AUTO_SYNC_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
 
     try:
         port = int(os.getenv("AUTO_SYNC_PORT", str(DEFAULT_PORT)))
     except ValueError:
         port = DEFAULT_PORT
 
-    log_dir_raw = os.getenv("AUTO_SYNC_LOG_DIR", ".auto_sync_logs")
+    log_dir_raw = os.getenv("AUTO_SYNC_LOG_DIR", DEFAULT_LOG_DIR).strip() or DEFAULT_LOG_DIR
     log_dir = (root / log_dir_raw).resolve()
 
     return BridgeConfig(
@@ -110,7 +157,7 @@ def ensure_runtime_dirs() -> None:
     (CONFIG.log_dir / "backups").mkdir(parents=True, exist_ok=True)
 
 
-def write_log(event: dict) -> None:
+def write_log(event: dict[str, Any]) -> None:
     ensure_runtime_dirs()
 
     log_file = CONFIG.log_dir / "sync.log.jsonl"
@@ -145,8 +192,8 @@ def normalize_request_text() -> str:
     return raw
 
 
-def extract_raw_blocks(text: str) -> list:
-    blocks = []
+def extract_raw_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
     search_from = 0
 
     while True:
@@ -158,7 +205,7 @@ def extract_raw_blocks(text: str) -> list:
         end_index = text.find(END_MARK, start_index)
 
         if end_index == -1:
-            raise SyncError("发现开始标记，但没有找到结束标记。")
+            break
 
         block_end = end_index + len(END_MARK)
         blocks.append(text[start_index:block_end])
@@ -263,7 +310,7 @@ def resolve_safe_target(relative_path: str) -> Path:
     if len(raw_path) >= 2 and raw_path[1] == ":":
         raise SyncError(f"禁止使用 Windows 盘符路径：{relative_path}")
 
-    parts = []
+    parts: list[str] = []
 
     for part in raw_path.split("/"):
         if part in {"", "."}:
@@ -309,7 +356,7 @@ def backup_existing_file(target: Path, relative_path: str) -> Optional[str]:
     return str(backup_path)
 
 
-def write_file(block: SyncBlock) -> dict:
+def write_file(block: SyncBlock) -> dict[str, Any]:
     target = resolve_safe_target(block.file_path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -345,7 +392,7 @@ def write_file(block: SyncBlock) -> dict:
     return result
 
 
-def run_command(command: list, cwd: Path) -> dict:
+def run_command(command: list[str], cwd: Path) -> dict[str, Any]:
     completed = subprocess.run(
         command,
         cwd=str(cwd),
@@ -370,7 +417,7 @@ def git_is_available() -> bool:
     return result["returncode"] == 0
 
 
-def git_commit_and_push(changed_files: list) -> dict:
+def git_commit_and_push(changed_files: list[str]) -> dict[str, Any]:
     if not CONFIG.git_enabled:
         return {
             "enabled": False,
@@ -393,7 +440,7 @@ def git_commit_and_push(changed_files: list) -> dict:
             "message": "当前项目根目录不是 Git 仓库。",
         }
 
-    commands = []
+    commands: list[dict[str, Any]] = []
 
     for file_path in changed_files:
         commands.append(run_command(["git", "add", "--", file_path], CONFIG.project_root))
@@ -465,10 +512,13 @@ def index() -> Response:
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-            max-width: 860px;
+            max-width: 900px;
             margin: 40px auto;
             line-height: 1.7;
             color: #222;
+        }}
+        h1 {{
+            margin-bottom: 8px;
         }}
         code {{
             background: #f2f2f2;
@@ -484,6 +534,10 @@ def index() -> Response:
             border-radius: 12px;
             padding: 16px 20px;
             background: #fafafa;
+            margin-top: 16px;
+        }}
+        .warn {{
+            color: #b45309;
         }}
     </style>
 </head>
@@ -499,6 +553,7 @@ def index() -> Response:
         <p><b>备份：</b><code>{CONFIG.backup_enabled}</code></p>
         <p><b>日志目录：</b><code>{CONFIG.log_dir}</code></p>
     </div>
+    <p class="warn">提示：本服务只建议在本机 127.0.0.1 使用，不要暴露到公网。</p>
 </body>
 </html>
 """
@@ -516,6 +571,7 @@ def health() -> Response:
             "git_enabled": CONFIG.git_enabled,
             "git_push": CONFIG.git_push,
             "backup_enabled": CONFIG.backup_enabled,
+            "log_dir": str(CONFIG.log_dir),
         }
     )
 

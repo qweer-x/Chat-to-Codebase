@@ -1,10 +1,57 @@
-# 忽略 Python 虚拟环境
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
 .venv/
 venv/
+env/
 ENV/
-*.pyc
-__pycache__/
-GitHub.py
-# 忽略本地敏感文件
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment
 .env
-###=== END_SYNC ===###
+.env.*
+!.env.example
+
+# AUTO_SYNC runtime files
+.auto_sync_logs/
+auto_sync_logs/
+logs/
+*.log
+
+# Legacy local files
+GitHub.py
+test_connection.txt
+
+# IDE / Editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# Node / frontend cache
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
