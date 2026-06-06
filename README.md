@@ -1,5 +1,3 @@
-## 介绍以及用法
-
 ### Chat-to-Codebase
 
 Chat-to-Codebase 是一个轻量级的网页 AI 自动同步桥。
